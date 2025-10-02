@@ -29,11 +29,17 @@ if TYPE_CHECKING:
 
 
 class SQLite3:
-    def __init__(self, fh: BinaryIO, wal_fh: BinaryIO | None = None):
+    def __init__(self, fh: BinaryIO, wal_fh: BinaryIO | None = None, wal_checkpoint: BinaryIO | None = None):
         self.fh = fh
         self.wal = WAL(wal_fh) if wal_fh else None
+        self.wal_checkpoint = wal_checkpoint
 
-        self.header = c_sqlite3.header(fh)
+        # Check if page 1 is in the wal or wal_checkpoint. If so, use the header from the wal or wal_checkpoint.
+        if 1 in self._get_wal_pages():
+            self.header = c_sqlite3.header(self._get_wal_pages()[1].data)
+        else:
+            self.header = c_sqlite3.header(fh)
+
         if self.header.magic != SQLITE3_HEADER_MAGIC:
             raise InvalidDatabase("Invalid header magic")
 
@@ -49,7 +55,15 @@ class SQLite3:
         self.page = lru_cache(256)(self.page)
 
     def open_wal(self, fh: BinaryIO) -> None:
-        self.wal = WAL(fh)
+        self.wal = WAL(self, fh)
+
+    def _get_wal_pages(self):
+        if self.wal_checkpoint:
+            return self.wal_checkpoint.root_page_map
+        elif self.wal:
+            return self.wal.valid_latest_pages
+        else:
+            return {}
 
     def table(self, name: str) -> Table | None:
         name = name.lower()
@@ -84,16 +98,25 @@ class SQLite3:
     def raw_page(self, num: int) -> bytes:
         # Only throw an out of bounds exception if the header contains a page_count.
         # Some old versions of SQLite3 do not set/update the page_count correctly.
-        if (num < 1 or num > self.header.page_count) and self.header.page_count > 0:
-            raise InvalidPageNumber("Page number exceeds boundaries")
-        if num == 1:  # Page 1 is root
+        if (num < 1 or num > self.header.page_count) and self.header.page_count > 0 and num not in self._get_wal_pages():
+            raise InvalidPageNumber(f"Page number {num} exceeds boundaries {self.header.page_count}")
+        elif num in self._get_wal_pages():
+            if num == 1:
+                return self._get_wal_pages()[num].data[len(c_sqlite3.header) :]
+            else:
+                return self._get_wal_pages()[num].data
+        elif num == 1:  # Page 1 is root
             self.fh.seek(len(c_sqlite3.header))
         else:
             self.fh.seek((num - 1) * self.page_size)
         return self.fh.read(self.header.page_size)
 
+    @lru_cache(maxsize=256)
     def page(self, num: int) -> Page:
-        return Page(self, num)
+        if num <= self.header.page_count:
+            return Page(self, num)
+        else:
+            return None
 
     def pages(self) -> Iterator[Page]:
         for i in range(self.header.page_count):
@@ -282,11 +305,17 @@ class Empty:
 
 
 class Page:
-    def __init__(self, sqlite: SQLite3, num: int):
+    def __init__(self, sqlite: SQLite3, num: int, raw_data: bytes | None = None):
         self.sqlite = sqlite
         self.num = num
 
-        self.data = sqlite.raw_page(num)
+        if raw_data:
+            if num == 1:
+                self.data = raw_data[len(c_sqlite3.header) :]
+            else:
+                self.data = raw_data
+        else:
+            self.data = sqlite.raw_page(num)
         self.offset = (num - 1) * sqlite.page_size
         buf = memoryview(self.data)
 
@@ -440,8 +469,9 @@ class Cell:
 
 
 class WAL:
-    def __init__(self, fh: BinaryIO):
+    def __init__(self, sqlite: SQLite3, fh: BinaryIO):
         self.fh = fh
+        self.sqlite = sqlite
         self.header = c_sqlite3.wal_header(fh)
 
         if self.header.magic not in WAL_HEADER_MAGIC:
@@ -449,6 +479,7 @@ class WAL:
 
         self.checksum_endian = "<" if self.header.magic == WAL_HEADER_MAGIC_LE else ">"
         self._checkpoints = None
+        self._valid_latest_pages = None
 
         self.frame = lru_cache(1024)(self.frame)
 
@@ -466,8 +497,10 @@ class WAL:
             except EOFError:  # noqa: PERF203
                 break
 
+    @property
     def checkpoints(self) -> list[WALCheckpoint]:
         if not self._checkpoints:
+            checkpoint_index = 0
             checkpoints = []
             frames = []
 
@@ -475,12 +508,30 @@ class WAL:
                 frames.append(frame)
 
                 if frame.page_count != 0:
-                    checkpoints.append(WALCheckpoint(self, frames))
+                    checkpoints.append(WALCheckpoint(self, checkpoint_index, frames))
                     frames = []
+                    checkpoint_index += 1
 
             self._checkpoints = checkpoints
 
         return self._checkpoints
+
+    @property
+    def valid_latest_pages(self) -> dict[int, WALFrame]:
+        if not self._valid_latest_pages:
+            # self._valid_latest_pages = {}
+            # for frame in self.frames():
+            #     if frame.valid:
+            #         self._valid_latest_pages[frame.page_number] = frame.page
+            self._valid_latest_pages = self.checkpoints[-1].root_page_map
+
+        return self._valid_latest_pages
+
+    def verify_wal_page(self, pagenum):
+        if pagenum in self.valid_latest_pages():
+            return self._valid_latest_pages[pagenum]
+        else:
+            return False
 
 
 class WALFrame:
@@ -490,7 +541,7 @@ class WALFrame:
 
         self.fh = wal.fh
         self._data = None
-
+        self._page = None
         self.fh.seek(offset)
         self.header = c_sqlite3.wal_frame(self.fh)
 
@@ -503,6 +554,14 @@ class WALFrame:
         salt2_match = self.header.salt2 == self.wal.header.salt2
 
         return salt1_match and salt2_match
+
+    @property
+    def page(self) -> Page:
+        if not self._page:
+            self.fh.seek(self.offset + len(c_sqlite3.wal_frame))
+            raw_data = self.fh.read(self.wal.header.page_size)
+            self._page = Page(self.wal.sqlite, self.page_number, raw_data=raw_data)
+        return self._page
 
     @property
     def data(self) -> bytes:
@@ -521,10 +580,12 @@ class WALFrame:
 
 
 class WALCheckpoint:
-    def __init__(self, wal: WAL, frames: list[WALFrame]):
+    def __init__(self, wal: WAL, index: int, frames: list[WALFrame]):
         self.wal = wal
+        self.index = index
         self.frames = frames
         self._page_map = None
+        self._root_page_map = None
 
     def __contains__(self, page: int) -> bool:
         return page in self.page_map
@@ -533,7 +594,7 @@ class WALCheckpoint:
         return self.page_map[page]
 
     def __repr__(self) -> str:
-        return f"<WALCheckpoint frames={len(self.frames)}>"
+        return f"<WALCheckpoint index={self.index} frames={len(self.frames)} length_root_pages={len(self.root_page_map)}>"
 
     @property
     def page_map(self) -> dict[int, WALFrame]:
@@ -542,7 +603,17 @@ class WALCheckpoint:
 
         return self._page_map
 
-    def get(self, page: int, default: Any = None) -> WALFrame:
+    @property
+    def root_page_map(self):
+        if not self._root_page_map:
+            self._root_page_map = self.page_map
+            for index in reversed(range(self.index)):
+                for page, frame in self.wal.checkpoints[index].page_map.items():
+                    if page not in self._root_page_map:
+                        self._root_page_map[page] = frame
+        return self._root_page_map
+
+    def get(self, page, default=None):
         return self.page_map.get(page, default)
 
 
