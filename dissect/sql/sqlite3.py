@@ -3,8 +3,9 @@ from __future__ import annotations
 import itertools
 import re
 import struct
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO
 
 from dissect.sql.c_sqlite3 import (
@@ -29,11 +30,59 @@ if TYPE_CHECKING:
 
 
 class SQLite3:
-    def __init__(self, fh: BinaryIO, wal_fh: BinaryIO | None = None):
-        self.fh = fh
-        self.wal = WAL(wal_fh) if wal_fh else None
+    def __init__(self, fh: Path | BinaryIO, wal_fh: Path | BinaryIO | None = None, wal_checkpoint: WALCheckpoint | int | None = None):
+        # Use the provided file handle or try to open the file path.
+        if hasattr(fh, "read"):
+            name = getattr(fh, "name", None)
+            path = Path(name) if name else None
+        else:
+            path = fh
+            fh = path.open("rb")
 
-        self.header = c_sqlite3.header(fh)
+        self.fh = fh
+        self.path = path
+
+        # Use the provided WAL file handle or try to open a sidecar WAL file.
+        if wal_fh is not None:
+            if hasattr(wal_fh, "read"):
+                name = getattr(wal_fh, "name", None)
+                wal_path = Path(name) if name else None
+            else:
+                if not isinstance(wal_fh, Path):
+                    wal_fh = Path(wal_fh)
+                wal_path = wal_fh
+                wal_fh = wal_path.open("rb")
+        elif self.path:
+            # Check for common WAL sidecars next to the DB.
+            for suffix in (".sqlite-wal", ".db-wal"):
+                candidate = self.path.with_suffix(suffix)
+                if candidate.exists():
+                    wal_path = candidate
+                    wal_fh = wal_path.open("rb")
+                    break
+        else:
+            wal_path = None
+            wal_fh = None
+
+        self.wal = WAL(wal_fh) if wal_fh else None
+        self.wal_path = wal_path if wal_fh else None
+        self.wal_checkpoint = wal_checkpoint
+
+        # if self.wal and self.wal_checkpoint is not None:
+        #     if isinstance(self.wal_checkpoint, int):
+        #         checkpoints = self.wal.checkpoints
+        #         if self.wal_checkpoint < 0 or self.wal_checkpoint >= len(checkpoints):
+        #             raise IndexError("WAL checkpoint index out of range")
+        #         self.wal_checkpoint = checkpoints[self.wal_checkpoint]
+
+        #     for frame in self.wal_checkpoint.frames:
+        #         print(frame)
+        #         checkpoint_page = self.page(frame.page_number)
+        #         checkpoint_cell_values = [cell.values for cell in checkpoint_page.cells()]
+
+        #         print(checkpoint_page, checkpoint_cell_values)
+
+        self.header = c_sqlite3.header(self.fh)
         if self.header.magic != SQLITE3_HEADER_MAGIC:
             raise InvalidDatabase("Invalid header magic")
 
@@ -50,6 +99,9 @@ class SQLite3:
 
     def open_wal(self, fh: BinaryIO) -> None:
         self.wal = WAL(fh)
+
+    def checkpoint(self) -> Iterator[SQLite3]:
+        pass
 
     def table(self, name: str) -> Table | None:
         name = name.lower()
@@ -86,6 +138,13 @@ class SQLite3:
         # Some old versions of SQLite3 do not set/update the page_count correctly.
         if (num < 1 or num > self.header.page_count) and self.header.page_count > 0:
             raise InvalidPageNumber("Page number exceeds boundaries")
+
+        if self.wal:
+            for checkpoint in self.wal.checkpoints[::-1]:
+                if num in checkpoint.page_map:
+                    frame = checkpoint.page_map[num]
+                    return frame.data
+
         if num == 1:  # Page 1 is root
             self.fh.seek(len(c_sqlite3.header))
         else:
@@ -466,21 +525,22 @@ class WAL:
             except EOFError:  # noqa: PERF203
                 break
 
+    @cached_property
     def checkpoints(self) -> list[WALCheckpoint]:
-        if not self._checkpoints:
-            checkpoints = []
-            frames = []
+        checkpoints = []
+        frames = []
 
-            for frame in self.frames():
-                frames.append(frame)
+        for frame in self.frames():
+            frames.append(frame)
 
-                if frame.page_count != 0:
-                    checkpoints.append(WALCheckpoint(self, frames))
-                    frames = []
+            if frame.page_count != 0:
+                checkpoints.append(WALCheckpoint(self, frames))
+                frames = []
 
-            self._checkpoints = checkpoints
+        if frames:
+            checkpoints.append(WALCheckpoint(self, frames))
 
-        return self._checkpoints
+        return checkpoints
 
 
 class WALFrame:
@@ -524,7 +584,7 @@ class WALCheckpoint:
     def __init__(self, wal: WAL, frames: list[WALFrame]):
         self.wal = wal
         self.frames = frames
-        self._page_map = None
+        self.checkpoint_sequence_number = wal.header.checkpoint_sequence_number
 
     def __contains__(self, page: int) -> bool:
         return page in self.page_map
@@ -535,12 +595,9 @@ class WALCheckpoint:
     def __repr__(self) -> str:
         return f"<WALCheckpoint frames={len(self.frames)}>"
 
-    @property
+    @cached_property
     def page_map(self) -> dict[int, WALFrame]:
-        if not self._page_map:
-            self._page_map = {frame.page_number: frame for frame in self.frames}
-
-        return self._page_map
+        return {frame.page_number: frame for frame in self.frames}
 
     def get(self, page: int, default: Any = None) -> WALFrame:
         return self.page_map.get(page, default)
