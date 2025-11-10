@@ -1,15 +1,17 @@
+from __future__ import annotations
+
 import pytest
 
 from dissect.sql.sqlite3 import Column, Table
 
 
-def test_column_default():
+def test_column_default() -> None:
     column = Column("normal_definition", "")
     assert column.default_value is None
 
 
 @pytest.mark.parametrize(
-    "default_value, expected_value",
+    ("default_value", "expected_value"),
     [
         (1, 1),
         (-1, -1),
@@ -28,13 +30,13 @@ def test_column_default():
         ("(something == (DATA == (BETA not NULL)))", None),
     ],
 )
-def test_column_default_definitions(default_value, expected_value):
+def test_column_default_definitions(default_value: int | str, expected_value: int | bool | str | None) -> None:
     column = Column("normal_definition", "")
     default = column._parse_default_value_from_description(f"DEFAULT {default_value}")
     assert default == expected_value
 
 
-def test_parse_table_defaults():
+def test_parse_table_defaults() -> None:
     table_definition = """
         CREATE TABLE test (
             id INTEGER PRIMARY KEY,
@@ -44,7 +46,9 @@ def test_parse_table_defaults():
             new_test DEFAULT (1),
             extra_test DEFAULT ("hello world"),
             all_tests DEFAULT (-1.1),
-            test DEFAULT (x == NULL)
+            test DEFAULT (x == NULL),
+            some_test INTEGER DEFAULT (0) NOT NULL,
+            another_test VARCHAR(1337) DEFAULT ("test") NOT NULL
         );
     """
     table = Table(sqlite=None, type_=None, name=None, table_name=None, page=None, sql=table_definition)
@@ -57,12 +61,15 @@ def test_parse_table_defaults():
         ("extra_test", "hello world"),
         ("all_tests", -1.1),
         ("test", None),
+        ("some_test", 0),
+        ("another_test", "test"),
     ]
     for key, value in assertion_data:
         assert column_name_for_key(table.columns, key).default_value == value
 
 
-def column_name_for_key(columns, key):
+def column_name_for_key(columns: list[Column], key: str) -> Column | None:
     for column in columns:
         if column.name == key:
             return column
+    return None

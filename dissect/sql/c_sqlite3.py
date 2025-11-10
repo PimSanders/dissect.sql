@@ -1,5 +1,8 @@
-from dissect import cstruct
+from __future__ import annotations
 
+from dissect.cstruct import cstruct
+
+# Resource: https://www.sqlite.org/fileformat.html
 sqlite3_def = """
 #define PAGE_FLAG_INTKEY      0x01
 #define PAGE_FLAG_ZERODATA    0x02
@@ -66,8 +69,7 @@ struct wal_frame {
 };
 """
 
-c_sqlite3 = cstruct.cstruct(endian=">")
-c_sqlite3.load(sqlite3_def)
+c_sqlite3 = cstruct(endian=">").load(sqlite3_def)
 
 ENCODING = {
     1: "utf-8",
@@ -82,14 +84,15 @@ PAGE_TYPES = {
     c_sqlite3.PAGE_TYPE_LEAF_TABLE: "PAGE_TYPE_LEAF_TABLE",
 }
 
+# See https://www.sqlite.org/fileformat.html -- Record format
 SERIAL_TYPES = {
     0: lambda fh: None,
-    1: c_sqlite3.uint8,
-    2: c_sqlite3.uint16,
-    3: c_sqlite3.uint24,
-    4: c_sqlite3.uint32,
-    5: c_sqlite3.uint48,
-    6: c_sqlite3.uint64,
+    1: c_sqlite3.int8,
+    2: c_sqlite3.int16,
+    3: c_sqlite3.int24,
+    4: c_sqlite3.int32,
+    5: c_sqlite3.int48,
+    6: c_sqlite3.int64,
     7: c_sqlite3.double,
     8: lambda fh: 0,
     9: lambda fh: 1,

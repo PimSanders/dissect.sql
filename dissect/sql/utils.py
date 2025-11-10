@@ -1,27 +1,49 @@
+from __future__ import annotations
+
 import re
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING
 
 from dissect.sql.exceptions import InvalidSQL
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
-def split_sql_list(sql):
-    """Split a string on comma's (`,') while ignoring any comma's contained
-    within an arbitrary level of nested braces (`( )')
+
+def split_sql_list(sql: str) -> Iterator[str]:
+    """Split a string on comma's (``,``) while ignoring any comma's contained
+    within an arbitrary level of nested braces (``( )``)
     """
     level = 0
+    comment = 0
+    quote = None
     line_buf = ""
+
     for char in sql:
-        if char == "(":
-            level += 1
-            line_buf += char
-        elif char == ")":
-            level -= 1
-            line_buf += char
-        elif char == "," and level == 0:
-            yield line_buf.strip()
-            line_buf = ""
-        else:
-            line_buf += char
+        if not quote and char == "-" and comment != 2:
+            comment += 1
+        elif comment == 2 and char == "\n":
+            comment = 0
+        elif comment != 2:
+            if comment == 1:
+                line_buf += "-"
+                comment = 0
+
+            if char == "(":
+                level += 1
+                line_buf += char
+            elif char == ")":
+                level -= 1
+                line_buf += char
+            elif char == "," and level == 0:
+                yield line_buf.strip()
+                line_buf = ""
+            else:
+                if char in ('"', "'", "`"):
+                    if not quote:
+                        quote = char
+                    elif char == quote:
+                        quote = None
+                line_buf += char
 
     if level != 0:
         bracket_type = "(" if level < 0 else ")"
@@ -31,7 +53,7 @@ def split_sql_list(sql):
         yield line_buf.strip()
 
 
-def parse_table_columns_constraints(sql):
+def parse_table_columns_constraints(sql: str) -> tuple[str | None, list[str], list[str]]:
     """Parse SQL CREATE TABLE statements and return the primary key, column
     definitions and table constraints.
 
@@ -69,7 +91,7 @@ def parse_table_columns_constraints(sql):
         elif "PRIMARY KEY" in column_type_constraint.upper():
             primary_key = column_name
 
-        if column_name.upper().startswith(
+        if "(" in column_def and column_name.upper().startswith(
             (
                 "CONSTRAINT",
                 "UNIQUE",
@@ -86,7 +108,7 @@ def parse_table_columns_constraints(sql):
     return primary_key, columns, table_constraints
 
 
-def split_column_def(sql: str, column_def: str) -> Tuple[str, str]:
+def split_column_def(sql: str, column_def: str) -> tuple[str, str]:
     """Splits the column definition to name and constraint."""
 
     column_parts = column_def.split(maxsplit=1)
@@ -96,10 +118,13 @@ def split_column_def(sql: str, column_def: str) -> Tuple[str, str]:
     column_name = column_parts[0]
     column_type_constraint = column_parts[1] if len(column_parts) > 1 else ""
 
+    if column_name[0] in ('"', "'", "`"):
+        column_name = column_name[1:-1]
+
     return column_name, column_type_constraint
 
 
-def get_primary_key_from_constraint(column_type_constraint: str, column_def: str, sql: str) -> Optional[str]:
+def get_primary_key_from_constraint(column_type_constraint: str, column_def: str, sql: str) -> str | None:
     """Finds a primary key from sql string."""
     primary_key = None
 
@@ -109,7 +134,7 @@ def get_primary_key_from_constraint(column_type_constraint: str, column_def: str
             f"Not a valid CREATE TABLE definition: invalid PRIMARY KEY table constraint {column_def!r} in {sql!r}"
         )
     matched_group = primary_key_sql.groups()[0]
-    primary_key_defs = [key_def for key_def in split_sql_list(matched_group)]
+    primary_key_defs = list(split_sql_list(matched_group))
     # We only handle single primary keys, no compound keys or
     # expressions, so a single entry in the list consisting of a single
     # part.
