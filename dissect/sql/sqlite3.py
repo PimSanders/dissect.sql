@@ -563,7 +563,7 @@ class WAL:
             # A commit record has a page_count header greater than zero
             if frame.page_count != 0:
                 commits.append(WALCommit(self, frames))
-            frames = []
+                frames = []
 
         # if frames:
         #     commits.append(WALCommit(self, frames))
