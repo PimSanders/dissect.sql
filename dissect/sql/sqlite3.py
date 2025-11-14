@@ -30,7 +30,12 @@ if TYPE_CHECKING:
 
 
 class SQLite3:
-    def __init__(self, fh: Path | BinaryIO, wal_fh: Path | BinaryIO | None = None, wal_checkpoint: WALCheckpoint | int | None = None):
+    def __init__(
+        self,
+        fh: Path | BinaryIO,
+        wal_fh: Path | BinaryIO | None = None,
+        wal_checkpoint: WALCheckpoint | int | None = None,
+    ):
         # Use the provided file handle or try to open the file path.
         if hasattr(fh, "read"):
             name = getattr(fh, "name", None)
@@ -68,19 +73,12 @@ class SQLite3:
         self.wal_path = wal_path if wal_fh else None
         self.wal_checkpoint = wal_checkpoint
 
-        # if self.wal and self.wal_checkpoint is not None:
-        #     if isinstance(self.wal_checkpoint, int):
-        #         checkpoints = self.wal.checkpoints
-        #         if self.wal_checkpoint < 0 or self.wal_checkpoint >= len(checkpoints):
-        #             raise IndexError("WAL checkpoint index out of range")
-        #         self.wal_checkpoint = checkpoints[self.wal_checkpoint]
-
-        #     for frame in self.wal_checkpoint.frames:
-        #         print(frame)
-        #         checkpoint_page = self.page(frame.page_number)
-        #         checkpoint_cell_values = [cell.values for cell in checkpoint_page.cells()]
-
-        #         print(checkpoint_page, checkpoint_cell_values)
+        if self.wal and self.wal_checkpoint is not None and isinstance(self.wal_checkpoint, int):
+            checkpoint = self.wal_checkpoint
+            checkpoints = self.wal.checkpoints
+            if checkpoint < 0 or checkpoint >= len(checkpoints):
+                raise IndexError("WAL checkpoint index out of range")
+            self.wal_checkpoint = checkpoints[checkpoint]
 
         self.header = c_sqlite3.header(self.fh)
         if self.header.magic != SQLITE3_HEADER_MAGIC:
@@ -100,8 +98,12 @@ class SQLite3:
     def open_wal(self, fh: BinaryIO) -> None:
         self.wal = WAL(fh)
 
-    def checkpoint(self) -> Iterator[SQLite3]:
-        pass
+    def checkpoints(self) -> Iterator[SQLite3]:
+        if not self.wal:
+            return
+
+        for checkpoint in self.wal.commits:
+            yield SQLite3(self.fh, self.wal.fh, checkpoint)
 
     def table(self, name: str) -> Table | None:
         name = name.lower()
@@ -134,15 +136,32 @@ class SQLite3:
             yield Index(self, *cell.values)
 
     def raw_page(self, num: int) -> bytes:
+        """Retrieve the raw frame data for the given page number.
+
+        Reads the page from a checkpoint if provided.
+
+        Will first check if the WAL contains a more recent version of the page,
+        otherwise it will read the page from the database file.
+
+        References:
+            - https://sqlite.org/fileformat2.html#reader_algorithm
+        """
         # Only throw an out of bounds exception if the header contains a page_count.
         # Some old versions of SQLite3 do not set/update the page_count correctly.
         if (num < 1 or num > self.header.page_count) and self.header.page_count > 0:
             raise InvalidPageNumber("Page number exceeds boundaries")
 
+        # If a specific WAL checkpoint was provided, prefer it over the on-disk page.
+        if self.wal and self.wal_checkpoint is not None:
+            frame = self.wal_checkpoint.page_map.get(num)
+            if frame:
+                return frame.data
+
+        # Check if the latest version of the page is in one of the WAL commits.
         if self.wal:
-            for checkpoint in self.wal.checkpoints[::-1]:
-                if num in checkpoint.page_map:
-                    frame = checkpoint.page_map[num]
+            for commits in self.wal.commits[::-1]:
+                if num in commits.page_map:
+                    frame = commits.page_map[num]
                     return frame.data
 
         if num == 1:  # Page 1 is root
@@ -526,21 +545,53 @@ class WAL:
                 break
 
     @cached_property
-    def checkpoints(self) -> list[WALCheckpoint]:
-        checkpoints = []
+    def commits(self) -> list[WALCommit]:
+        """Collects all commits in the WAL file.
+
+        For commit records ``header.page_count`` specifies the size of the
+        database file in pages after the commit. For all other records it is 0.
+
+        References:
+            - https://sqlite.org/fileformat2.html#wal_file_format
+        """
+        commits = []
         frames = []
 
         for frame in self.frames():
             frames.append(frame)
 
+            # A commit record has a page_count header greater than zero
             if frame.page_count != 0:
-                checkpoints.append(WALCheckpoint(self, frames))
-                frames = []
+                commits.append(WALCommit(self, frames))
+            frames = []
 
-        if frames:
-            checkpoints.append(WALCheckpoint(self, frames))
+        # if frames:
+        #     commits.append(WALCommit(self, frames))
+        # Lose frames without a commit, not actually valid commits
 
-        return checkpoints
+        return commits
+
+    @cached_property
+    def checkpoints(self) -> list[WALCommit]:
+        """Return deduplicated WAL commits (checkpoints), newest first.
+
+        Deduplicate commits by the salt1 value of their first frame. Later
+        commits overwrite earlier ones so the returned list contains the most
+        recent commit for each salt1, sorted descending.
+        """
+        checkpoints_map: dict[int, WALCommit] = {}
+        for commit in self.commits:
+            if not commit.frames:
+                continue
+            salt1 = commit.frames[0].header.salt1
+            # Keep the most recent commit for each salt1 (later commits overwrite).
+            checkpoints_map[salt1] = commit
+
+        return sorted(
+            checkpoints_map.values(),
+            key=lambda c: c.frames[0].header.salt1,
+            reverse=True,
+        )
 
 
 class WALFrame:
@@ -580,11 +631,11 @@ class WALFrame:
         return self.header.page_count
 
 
+# Collection of frames that were committed together
 class WALCheckpoint:
     def __init__(self, wal: WAL, frames: list[WALFrame]):
         self.wal = wal
         self.frames = frames
-        self.checkpoint_sequence_number = wal.header.checkpoint_sequence_number
 
     def __contains__(self, page: int) -> bool:
         return page in self.page_map
@@ -594,6 +645,28 @@ class WALCheckpoint:
 
     def __repr__(self) -> str:
         return f"<WALCheckpoint frames={len(self.frames)}>"
+
+    @cached_property
+    def page_map(self) -> dict[int, WALFrame]:
+        return {frame.page_number: frame for frame in self.frames}
+
+    def get(self, page: int, default: Any = None) -> WALFrame:
+        return self.page_map.get(page, default)
+
+
+class WALCommit:
+    def __init__(self, wal: WAL, frames: list[WALFrame]):
+        self.wal = wal
+        self.frames = frames
+
+    def __contains__(self, page: int) -> bool:
+        return page in self.page_map
+
+    def __getitem__(self, page: int) -> WALFrame:
+        return self.page_map[page]
+
+    def __repr__(self) -> str:
+        return f"<WALCommit frames={len(self.frames)}>"
 
     @cached_property
     def page_map(self) -> dict[int, WALFrame]:
