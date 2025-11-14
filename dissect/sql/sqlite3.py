@@ -151,17 +151,23 @@ class SQLite3:
         if (num < 1 or num > self.header.page_count) and self.header.page_count > 0:
             raise InvalidPageNumber("Page number exceeds boundaries")
 
-        # If a specific WAL checkpoint was provided, prefer it over the on-disk page.
+        # If a specific WAL checkpoint was provided, use it instead of the on-disk page.
         if self.wal and self.wal_checkpoint is not None:
-            frame = self.wal_checkpoint.page_map.get(num)
-            if frame:
+            if num == 1:
+                self.fh.seek(len(c_sqlite3.header))
+            elif num in self.wal_checkpoint:
+                frame = self.wal_checkpoint.page_map.get(num)
                 return frame.data
+            else:
+                raise InvalidPageNumber("Page number not in WAL checkpoint")
 
+        #TODO return data if the last valid instance of page is a commit frame OR is followed by a commit frame
         # Check if the latest version of the page is in one of the WAL commits.
         if self.wal:
-            for commits in self.wal.commits[::-1]:
+            for commits in self.wal.commits:
                 if num in commits.page_map:
                     frame = commits.page_map[num]
+                    print(frame.header)
                     return frame.data
 
         if num == 1:  # Page 1 is root
@@ -561,13 +567,9 @@ class WAL:
             frames.append(frame)
 
             # A commit record has a page_count header greater than zero
-            if frame.page_count != 0:
+            if frame.page_count > 0:
                 commits.append(WALCommit(self, frames))
                 frames = []
-
-        # if frames:
-        #     commits.append(WALCommit(self, frames))
-        # Lose frames without a commit, not actually valid commits
 
         return commits
 
@@ -578,6 +580,10 @@ class WAL:
         Deduplicate commits by the salt1 value of their first frame. Later
         commits overwrite earlier ones so the returned list contains the most
         recent commit for each salt1, sorted descending.
+
+        References:
+            - https://sqlite.org/fileformat2.html#wal_file_format
+            - https://sqlite.org/wal.html#checkpointing
         """
         checkpoints_map: dict[int, WALCommit] = {}
         for commit in self.commits:
@@ -590,6 +596,7 @@ class WAL:
         return sorted(
             checkpoints_map.values(),
             key=lambda c: c.frames[0].header.salt1,
+            #TODO Should this be reverse? Reverse means: cp0 is the latest, cpN the oldest
             reverse=True,
         )
 
