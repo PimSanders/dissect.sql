@@ -159,16 +159,23 @@ class SQLite3:
                 frame = self.wal_checkpoint.page_map.get(num)
                 return frame.data
             else:
-                raise InvalidPageNumber("Page number not in WAL checkpoint")
+                raise InvalidPageNumber(f"Page number {num} not in WAL checkpoint")
 
-        #TODO return data if the last valid instance of page is a commit frame OR is followed by a commit frame
-        # Check if the latest version of the page is in one of the WAL commits.
+        # Check if the latest valid instance of the page is committed (either the frame itself
+        # is the commit frame or it is included in a commit's frames). If so, return that frame's data.
         if self.wal:
-            for commits in self.wal.commits:
-                if num in commits.page_map:
-                    frame = commits.page_map[num]
-                    print(frame.header)
-                    return frame.data
+            frames = list(self.wal.frames())
+            last_valid_frame = None
+            for f in frames:
+                if f.valid and f.page_number == num:
+                    last_valid_frame = f
+
+            if last_valid_frame is not None:
+                for commit in self.wal.commits:
+                    # commit.frames contains all frames that were committed together;
+                    # if our last valid frame is in one of those, it's part of that commit.
+                    if last_valid_frame in commit.frames:
+                        return last_valid_frame.data
 
         if num == 1:  # Page 1 is root
             self.fh.seek(len(c_sqlite3.header))
