@@ -20,5 +20,10 @@ def sqlite_db() -> Iterator[BinaryIO]:
 
 
 @pytest.fixture
+def sqlite_wal() -> Iterator[BinaryIO]:
+    yield from open_data("_data/test.sqlite-wal")
+
+
+@pytest.fixture
 def empty_db() -> Iterator[BinaryIO]:
     yield from open_data("_data/empty.sqlite")
