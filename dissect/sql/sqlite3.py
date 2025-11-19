@@ -156,10 +156,11 @@ class SQLite3:
             if num == 1:
                 self.fh.seek(len(c_sqlite3.header))
             elif num in self.wal_checkpoint:
-                frame = self.wal_checkpoint.page_map.get(num)
+                frame = self.wal_checkpoint.get(num)
                 return frame.data
             else:
-                raise InvalidPageNumber(f"Page number {num} not in WAL checkpoint")
+                # If the page is not present in the checkpoint, skip.
+                pass
 
         # Check if the latest valid instance of the page is committed (either the frame itself
         # is the commit frame or it is included in a commit's frames). If so, return that frame's data.
